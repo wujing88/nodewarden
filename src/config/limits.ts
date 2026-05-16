@@ -5,10 +5,10 @@
     accessTokenTtlSeconds: 7200,
     // Refresh token lifetime in milliseconds.
     // 刷新令牌有效期（毫秒）。
-    refreshTokenTtlMs: 30 * 24 * 60 * 60 * 1000,
+    refreshTokenTtlMs: 365 * 24 * 60 * 60 * 1000,
     // Grace window for previous refresh token after rotation (ms).
     // 刷新令牌轮换后的旧令牌宽限窗口（毫秒）。
-    refreshTokenOverlapGraceMs: 60 * 1000,
+    refreshTokenOverlapGraceMs: 30 * 60 * 1000,
     // Refresh token random byte length.
     // 刷新令牌随机字节长度。
     refreshTokenRandomBytes: 32,
@@ -24,6 +24,9 @@
     // Default PBKDF2 iterations for account creation/prelogin fallback.
     // 账户创建与预登录回退使用的默认 PBKDF2 迭代次数。
     defaultKdfIterations: 600000,
+    // clientSecret length
+    // clientSecret 长度
+    clientSecretLength: 30,
   },
   rateLimit: {
     // Max failed login attempts before temporary lock.
@@ -130,6 +133,9 @@
     // Max total items (folders + ciphers) allowed in a single import.
     // 单次导入允许的最大条目数（文件夹 + 密码项合计）。
     importItemLimit: 5000,
+    // Small fixed concurrency for blob/attachment batch cleanup work.
+    // 附件 / blob 批量清理时的保守并发数。
+    attachmentDeleteConcurrency: 4,
   },
   request: {
     // Hard body size limit for JSON API endpoints (bytes). File upload paths are exempt.

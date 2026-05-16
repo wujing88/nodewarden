@@ -26,7 +26,7 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
-
+.vite-tailwind.err
 # Environment
 .env
 .env.local
@@ -42,3 +42,8 @@ tmp/
 .tmp/
 
 nodewarden.wiki/
+wiki/
+AGENTS.md
+settings.json
+.claude/
+NodeWarden-compat/

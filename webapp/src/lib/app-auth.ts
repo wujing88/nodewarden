@@ -2,6 +2,7 @@ import {
   createAuthedFetch,
   deriveLoginHashLocally,
   getProfile,
+  loadProfileSnapshot,
   loadSession,
   loginWithPassword,
   refreshAccessToken,
@@ -10,6 +11,7 @@ import {
   unlockVaultKey,
 } from '@/lib/api/auth';
 import { readInviteCodeFromUrl } from '@/lib/app-support';
+import { t, translateServerError } from '@/lib/i18n';
 import type { AppPhase, Profile, SessionState, TokenSuccess, WebBootstrapResponse } from '@/lib/types';
 
 export interface PendingTotp {
@@ -22,14 +24,17 @@ export type JwtUnsafeReason = 'missing' | 'default' | 'too_short';
 
 export interface BootstrapAppResult {
   defaultKdfIterations: number;
+  registrationInviteRequired?: boolean;
   jwtWarning: { reason: JwtUnsafeReason; minLength: number } | null;
   session: SessionState | null;
   profile: Profile | null;
   phase: AppPhase;
+  needsBackgroundHydration?: boolean;
 }
 
 export interface InitialAppBootstrapState {
   defaultKdfIterations: number;
+  registrationInviteRequired?: boolean;
   jwtWarning: { reason: JwtUnsafeReason; minLength: number } | null;
   session: SessionState | null;
   phase: AppPhase;
@@ -51,8 +56,9 @@ export interface RecoverTwoFactorResult {
   newRecoveryCode: string | null;
 }
 
-function decodeJwtExp(accessToken: string): number | null {
+function decodeJwtExp(accessToken: string | undefined): number | null {
   try {
+    if (!accessToken) return null;
     const parts = accessToken.split('.');
     if (parts.length < 2) return null;
     const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
@@ -66,23 +72,24 @@ function decodeJwtExp(accessToken: string): number | null {
 }
 
 async function maybeRefreshSession(session: SessionState): Promise<SessionState | null> {
-  if (!session.refreshToken) return session;
+  if (!session.refreshToken && session.authMode !== 'web-cookie') return session.accessToken ? session : null;
   const exp = decodeJwtExp(session.accessToken);
   const nowSeconds = Math.floor(Date.now() / 1000);
 
-  if (exp !== null && exp - nowSeconds > 60) {
+  if (session.accessToken && exp !== null && exp - nowSeconds > 60) {
     return session;
   }
 
-  const refreshed = await refreshAccessToken(session.refreshToken);
-  if (!refreshed?.access_token) {
-    return exp !== null && exp > nowSeconds ? session : null;
+  const refreshed = await refreshAccessToken(session);
+  if (!refreshed.ok) {
+    return session.accessToken && exp !== null && exp > nowSeconds ? session : null;
   }
 
   return {
     ...session,
-    accessToken: refreshed.access_token,
-    refreshToken: refreshed.refresh_token || session.refreshToken,
+    accessToken: refreshed.token.access_token,
+    refreshToken: refreshed.token.refresh_token || session.refreshToken,
+    authMode: refreshed.token.web_session ? 'web-cookie' : (session.authMode || 'token'),
   };
 }
 
@@ -92,8 +99,10 @@ function readWindowBootstrap(): WebBootstrapResponse {
   return raw && typeof raw === 'object' ? raw : {};
 }
 
-function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialAppBootstrapState, 'defaultKdfIterations' | 'jwtWarning'> {
+function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialAppBootstrapState, 'defaultKdfIterations' | 'registrationInviteRequired' | 'jwtWarning'> {
   const defaultKdfIterations = Number(boot.defaultKdfIterations || 600000);
+  const registrationInviteRequired =
+    typeof boot.registrationInviteRequired === 'boolean' ? boot.registrationInviteRequired : undefined;
   const jwtUnsafeReason = boot.jwtUnsafeReason || null;
   const jwtWarning = jwtUnsafeReason
     ? {
@@ -104,6 +113,7 @@ function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialApp
 
   return {
     defaultKdfIterations,
+    registrationInviteRequired,
     jwtWarning,
   };
 }
@@ -140,7 +150,7 @@ function decodeAccessTokenClaims(accessToken: string): AccessTokenClaims {
   }
 }
 
-function buildTransientProfile(token: TokenSuccess, email: string): Profile {
+function buildTransientProfile(token: TokenSuccess, email: string, fallbackProfile: Profile | null = null): Profile {
   const claims = decodeAccessTokenClaims(token.access_token);
   const normalizedEmail = String(claims.email || email || '').trim().toLowerCase();
   const accountKeys = token.accountKeys ?? token.AccountKeys ?? null;
@@ -150,23 +160,31 @@ function buildTransientProfile(token: TokenSuccess, email: string): Profile {
     name: String(claims.name || normalizedEmail || ''),
     key: String(token.Key || ''),
     privateKey: token.PrivateKey ?? null,
-    role: 'user',
+    role: fallbackProfile?.role === 'admin' ? 'admin' : 'user',
     premium: !!claims.premium,
     accountKeys,
+    masterPasswordHint: fallbackProfile?.masterPasswordHint ?? null,
+    publicKey: fallbackProfile?.publicKey ?? null,
     object: 'profile',
   };
 }
 
+function resolveUnauthenticatedPhase(registrationInviteRequired: boolean | undefined, fallback: AppPhase): AppPhase {
+  return registrationInviteRequired === false ? 'register' : fallback;
+}
+
 export function readInitialAppBootstrapState(): InitialAppBootstrapState {
-  const { defaultKdfIterations, jwtWarning } = normalizeBootstrapResponse(readWindowBootstrap());
+  const { defaultKdfIterations, registrationInviteRequired, jwtWarning } = normalizeBootstrapResponse(readWindowBootstrap());
   const session = loadSession();
   const hasInviteCode = !!readInviteCodeFromUrl();
+  const unauthenticatedPhase = hasInviteCode ? 'register' : 'login';
 
   return {
     defaultKdfIterations,
+    registrationInviteRequired,
     jwtWarning,
     session,
-    phase: jwtWarning ? 'login' : session ? 'locked' : hasInviteCode ? 'register' : 'login',
+    phase: jwtWarning ? 'login' : session ? 'locked' : resolveUnauthenticatedPhase(registrationInviteRequired, unauthenticatedPhase),
   };
 }
 
@@ -174,11 +192,13 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
   const remoteBoot = await fetchBootstrapConfig();
   const normalizedBoot = normalizeBootstrapResponse(remoteBoot);
   const defaultKdfIterations = normalizedBoot.defaultKdfIterations || initial.defaultKdfIterations;
+  const registrationInviteRequired = normalizedBoot.registrationInviteRequired ?? initial.registrationInviteRequired;
   const jwtWarning = normalizedBoot.jwtWarning ?? initial.jwtWarning;
 
   if (jwtWarning) {
     return {
       defaultKdfIterations,
+      registrationInviteRequired,
       jwtWarning,
       session: null,
       profile: null,
@@ -190,38 +210,61 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
   if (!loaded) {
     return {
       defaultKdfIterations,
+      registrationInviteRequired,
       jwtWarning: null,
       session: null,
       profile: null,
-      phase: initial.phase,
+      phase: resolveUnauthenticatedPhase(registrationInviteRequired, initial.phase),
     };
   }
 
+  const cachedProfile = loadProfileSnapshot(loaded.email);
+  if (cachedProfile) {
+    return {
+      defaultKdfIterations,
+      registrationInviteRequired,
+      jwtWarning: null,
+      session: loaded,
+      profile: cachedProfile,
+      phase: 'locked',
+      needsBackgroundHydration: true,
+    };
+  }
+
+  return {
+    defaultKdfIterations,
+    registrationInviteRequired,
+    jwtWarning: null,
+    session: loaded,
+    profile: null,
+    phase: 'locked',
+    needsBackgroundHydration: true,
+  };
+}
+
+export async function hydrateLockedSession(
+  session: SessionState,
+  fallbackProfile: Profile | null = null
+): Promise<{ session: SessionState | null; profile: Profile | null }> {
+  const refreshedSession = await maybeRefreshSession(session);
+  if (!refreshedSession?.accessToken) {
+    return { session: null, profile: null };
+  }
   try {
-    const session = await maybeRefreshSession(loaded);
-    if (!session) {
-      throw new Error('Session expired');
-    }
     const profile = await getProfile(
       createAuthedFetch(
-        () => session,
+        () => refreshedSession,
         () => {}
       )
     );
     return {
-      defaultKdfIterations,
-      jwtWarning: null,
-      session,
+      session: refreshedSession,
       profile,
-      phase: 'locked',
     };
   } catch {
     return {
-      defaultKdfIterations,
-      jwtWarning: null,
-      session: null,
-      profile: null,
-      phase: initial.phase === 'register' ? 'register' : 'login',
+      session: refreshedSession,
+      profile: fallbackProfile,
     };
   }
 }
@@ -232,16 +275,18 @@ export async function completeLogin(
   masterKey: Uint8Array
 ): Promise<CompletedLogin> {
   const normalizedEmail = email.trim().toLowerCase();
+  const fallbackProfile = loadProfileSnapshot(normalizedEmail);
   const baseSession: SessionState = {
     accessToken: token.access_token,
     refreshToken: token.refresh_token,
     email: normalizedEmail,
+    authMode: token.web_session ? 'web-cookie' : 'token',
   };
   const tempFetch = createAuthedFetch(
     () => baseSession,
     () => {}
   );
-  const profile = buildTransientProfile(token, normalizedEmail);
+  const profile = buildTransientProfile(token, normalizedEmail, fallbackProfile);
   if (!profile.key) {
     throw new Error('Missing profile key');
   }
@@ -283,7 +328,7 @@ export async function performPasswordLogin(
 
   return {
     kind: 'error',
-    message: tokenError.error_description || tokenError.error || 'Login failed',
+    message: translateServerError(tokenError.error_description || tokenError.error, t('txt_login_failed')),
   };
 }
 
@@ -300,7 +345,7 @@ export async function performTotpLogin(
     return completeLogin(token, pendingTotp.email, pendingTotp.masterKey);
   }
   const tokenError = token as { error_description?: string; error?: string };
-  throw new Error(tokenError.error_description || tokenError.error || 'TOTP verify failed');
+  throw new Error(translateServerError(tokenError.error_description || tokenError.error, t('txt_totp_verify_failed')));
 }
 
 export async function performRecoverTwoFactorLogin(
@@ -347,15 +392,36 @@ export async function performRegistration(args: {
 
 export async function performUnlock(
   session: SessionState,
-  profile: Profile,
+  profile: Profile | null,
   password: string,
   fallbackIterations: number
-): Promise<SessionState> {
-  const derived = await deriveLoginHashLocally(profile.email || session.email, password, fallbackIterations);
-  const keys = await unlockVaultKey(profile.key, derived.masterKey);
-  const refreshedSession = await maybeRefreshSession(session);
-  if (!refreshedSession) {
-    throw new Error('Session expired');
+): Promise<PasswordLoginResult> {
+  const normalizedEmail = (profile?.email || session.email).trim().toLowerCase();
+  const derived = await deriveLoginHashLocally(normalizedEmail, password, fallbackIterations);
+  const token = await loginWithPassword(normalizedEmail, derived.hash, { useRememberToken: true });
+
+  if ('access_token' in token && token.access_token) {
+    return {
+      kind: 'success',
+      login: await completeLogin(token, normalizedEmail, derived.masterKey),
+    };
   }
-  return { ...refreshedSession, ...keys };
+
+  const tokenError = token as { TwoFactorProviders?: unknown; error_description?: string; error?: string };
+  if (tokenError.TwoFactorProviders) {
+    return {
+      kind: 'totp',
+      pendingTotp: {
+        email: normalizedEmail,
+        passwordHash: derived.hash,
+        masterKey: derived.masterKey,
+      },
+    };
+  }
+
+  return {
+    kind: 'error',
+    message: translateServerError(tokenError.error_description || tokenError.error, t('txt_unlock_failed')),
+  };
 }
+
