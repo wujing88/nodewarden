@@ -1,14 +1,28 @@
 import { zipSync, unzipSync } from 'fflate';
 import type { Env } from '../types';
 import { APP_VERSION } from '../../shared/app-version';
+import { BACKUP_SETTINGS_CONFIG_KEY } from './backup-config';
+import { exportPortableBackupSettingsEnvelope } from './backup-settings-crypto';
 import {
   getAttachmentObjectKey,
   getBlobStorageKind,
 } from './blob-store';
 
+// CONTRACT:
+// This file defines the exported instance-backup archive shape. Keep it in lock
+// step with src/services/backup-import.ts and webapp/src/lib/api/backup.ts.
+//
+// WHEN CHANGING THIS:
+// - Add persistent tables to BackupPayload, export SQL, manifest tableCounts,
+//   and validateBackupPayloadContents().
+// - Keep secrets and transient runtime rows sanitized before writing db.json.
+// - users.api_key is intentionally not exported.
+// - backup.settings.v1 is exported as portable-only; the current server runtime
+//   envelope must not leave the instance.
 type SqlRow = Record<string, string | number | null>;
 
 const BACKUP_FORMAT_VERSION = 1;
+const BACKUP_RUNNER_LOCK_CONFIG_KEY = 'backup.runner.lock.v1';
 const BACKUP_FILE_HASH_PREFIX_LENGTH = 5;
 // Worker-side backup export must stay well below Cloudflare CPU limits.
 // Prefer store-only ZIP entries over heavier compression to keep exports reliable.
@@ -48,6 +62,7 @@ export interface BackupPayload {
   db: {
     config: SqlRow[];
     users: SqlRow[];
+    domain_settings: SqlRow[];
     user_revisions: SqlRow[];
     folders: SqlRow[];
     ciphers: SqlRow[];
@@ -71,6 +86,7 @@ export interface BackupFileIntegrityCheckResult {
 export interface BuildBackupArchiveOptions {
   includeAttachments?: boolean;
   progress?: BackupArchiveBuildProgressReporter;
+  timeZone?: string;
 }
 
 export interface BackupArchiveBuildProgressEvent {
@@ -88,22 +104,52 @@ async function queryRows(db: D1Database, sql: string, ...values: unknown[]): Pro
   return (result.results || []).map((row) => ({ ...row }));
 }
 
+function sanitizeConfigRowsForExport(rows: SqlRow[]): SqlRow[] {
+  const sanitized: SqlRow[] = [];
+  for (const row of rows) {
+    const key = String(row.key || '').trim();
+    if (!key || key === BACKUP_RUNNER_LOCK_CONFIG_KEY) continue;
+
+    if (key === BACKUP_SETTINGS_CONFIG_KEY) {
+      const portableOnly = exportPortableBackupSettingsEnvelope(typeof row.value === 'string' ? row.value : null);
+      if (portableOnly) sanitized.push({ ...row, value: portableOnly });
+      continue;
+    }
+
+    sanitized.push({ ...row });
+  }
+  return sanitized;
+}
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function buildBackupFileName(date: Date = new Date(), checksumPrefix: string | null = null): string {
-  const parts = [
-    date.getUTCFullYear().toString().padStart(4, '0'),
-    (date.getUTCMonth() + 1).toString().padStart(2, '0'),
-    date.getUTCDate().toString().padStart(2, '0'),
-    date.getUTCHours().toString().padStart(2, '0'),
-    date.getUTCMinutes().toString().padStart(2, '0'),
-    date.getUTCSeconds().toString().padStart(2, '0'),
-  ];
+function getDateParts(date: Date, timeZone: string): string {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = formatter.formatToParts(date);
+  const pick = (type: string): string => parts.find((part) => part.type === type)?.value || '';
+  return `${pick('year')}${pick('month')}${pick('day')}_${pick('hour')}${pick('minute')}${pick('second')}`;
+}
+
+function buildBackupFileNameInTimeZone(
+  date: Date = new Date(),
+  checksumPrefix: string | null = null,
+  timeZone: string = 'UTC'
+): string {
+  const parts = getDateParts(date, timeZone);
   const suffix = checksumPrefix ? `_${checksumPrefix}` : '';
-  return `nodewarden_backup_${parts[0]}${parts[1]}${parts[2]}_${parts[3]}${parts[4]}${parts[5]}${suffix}.zip`;
+  return `nodewarden_backup_${parts}${suffix}.zip`;
 }
 
 export function extractBackupFileChecksumPrefix(fileName: string): string | null {
@@ -250,6 +296,7 @@ export function validateBackupPayloadContents(
   const configRows = ensureRowArray(payload.db.config, 'config');
   const userRows = ensureRowArray(payload.db.users, 'users');
   const revisionRows = ensureRowArray(payload.db.user_revisions, 'user_revisions');
+  const domainSettingsRows = ensureRowArray(payload.db.domain_settings || [], 'domain_settings');
   const folderRows = ensureRowArray(payload.db.folders, 'folders');
   const cipherRows = ensureRowArray(payload.db.ciphers, 'ciphers');
   const attachmentRows = ensureRowArray(payload.db.attachments, 'attachments');
@@ -278,6 +325,18 @@ export function validateBackupPayloadContents(
     if (!userId || !userIds.has(userId)) {
       throw new Error(`Backup archive contains a revision for an unknown user: ${userId || '(empty)'}`);
     }
+  }
+
+  const domainSettingUserIds = new Set<string>();
+  for (const row of domainSettingsRows) {
+    const userId = String(row.user_id || '').trim();
+    if (!userId || !userIds.has(userId)) {
+      throw new Error(`Backup archive contains domain settings for an unknown user: ${userId || '(empty)'}`);
+    }
+    if (domainSettingUserIds.has(userId)) {
+      throw new Error(`Backup archive contains duplicate domain settings for user: ${userId}`);
+    }
+    domainSettingUserIds.add(userId);
   }
 
   const folderIds = new Set<string>();
@@ -331,14 +390,16 @@ export async function buildBackupArchive(
     includeAttachments,
   });
   const encoder = new TextEncoder();
-  const [configRows, userRows, revisionRows, folderRows, cipherRows, attachmentRows] = await Promise.all([
+  const [configRows, userRows, domainSettingsRows, revisionRows, folderRows, cipherRows, attachmentRows] = await Promise.all([
     queryRows(env.DB, 'SELECT key, value FROM config ORDER BY key ASC'),
     queryRows(env.DB, 'SELECT id, email, name, master_password_hint, master_password_hash, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, role, status, verify_devices, totp_secret, totp_recovery_code, created_at, updated_at FROM users ORDER BY created_at ASC'),
+    queryRows(env.DB, 'SELECT user_id, equivalent_domains, custom_equivalent_domains, excluded_global_equivalent_domains, updated_at FROM domain_settings ORDER BY user_id ASC'),
     queryRows(env.DB, 'SELECT user_id, revision_date FROM user_revisions ORDER BY user_id ASC'),
     queryRows(env.DB, 'SELECT id, user_id, name, created_at, updated_at FROM folders ORDER BY created_at ASC'),
     queryRows(env.DB, 'SELECT id, user_id, type, folder_id, name, notes, favorite, data, reprompt, key, created_at, updated_at, archived_at, deleted_at FROM ciphers ORDER BY created_at ASC'),
     queryRows(env.DB, 'SELECT id, cipher_id, file_name, size, size_name, key FROM attachments ORDER BY cipher_id ASC, id ASC'),
   ]);
+  const exportedConfigRows = sanitizeConfigRowsForExport(configRows);
   const exportedAttachmentRows = includeAttachments ? attachmentRows : [];
   const attachmentBlobs: BackupManifestAttachmentBlob[] = exportedAttachmentRows.map((row) => {
     const cipherId = String(row.cipher_id || '').trim();
@@ -357,8 +418,9 @@ export async function buildBackupArchive(
     appVersion: APP_VERSION,
     storageKind: getBlobStorageKind(env),
     tableCounts: {
-      config: configRows.length,
+      config: exportedConfigRows.length,
       users: userRows.length,
+      domain_settings: domainSettingsRows.length,
       user_revisions: revisionRows.length,
       folders: folderRows.length,
       ciphers: cipherRows.length,
@@ -378,8 +440,9 @@ export async function buildBackupArchive(
   const files: Record<string, Uint8Array> = {
     'manifest.json': encoder.encode(JSON.stringify(manifestBase, null, BACKUP_JSON_INDENT)),
     'db.json': encoder.encode(JSON.stringify({
-      config: configRows,
+      config: exportedConfigRows,
       users: userRows,
+      domain_settings: domainSettingsRows,
       user_revisions: revisionRows,
       folders: folderRows,
       ciphers: cipherRows,
@@ -398,7 +461,8 @@ export async function buildBackupArchive(
   });
   const bytes = zipSync(createZipEntries(files));
   const fileHashPrefix = (await sha256Hex(bytes)).slice(0, BACKUP_FILE_HASH_PREFIX_LENGTH);
-  const fileName = buildBackupFileName(date, fileHashPrefix);
+  const backupTimeZone = options.timeZone || 'UTC';
+  const fileName = buildBackupFileNameInTimeZone(date, fileHashPrefix, backupTimeZone);
   await options.progress?.({
     step: 'archive_ready',
     fileName,

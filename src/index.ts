@@ -9,6 +9,15 @@ let dbInitialized = false;
 let dbInitError: string | null = null;
 let dbInitPromise: Promise<void> | null = null;
 
+function normalizeRequestUrl(request: Request): Request {
+  const url = new URL(request.url);
+  const normalizedPathname = url.pathname.length <= 1 ? url.pathname : url.pathname.replace(/\/+$/, '');
+  if (normalizedPathname === url.pathname) return request;
+
+  url.pathname = normalizedPathname;
+  return new Request(url.toString(), request);
+}
+
 function isWorkerHandledPath(path: string): boolean {
   return (
     path.startsWith('/api/') ||
@@ -22,13 +31,33 @@ function isWorkerHandledPath(path: string): boolean {
   );
 }
 
+function addSearchIndexHeaders(request: Request, response: Response): Response {
+  const url = new URL(request.url);
+  const contentType = String(response.headers.get('Content-Type') || '').toLowerCase();
+  const shouldNoIndex =
+    url.pathname === '/robots.txt' ||
+    contentType.includes('text/html');
+
+  if (!shouldNoIndex) return response;
+
+  const headers = new Headers(response.headers);
+  headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet');
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function maybeServeAsset(request: Request, env: Env): Promise<Response | null> {
   if (!env.ASSETS) return null;
   if (request.method !== 'GET' && request.method !== 'HEAD') return null;
   const url = new URL(request.url);
   if (isWorkerHandledPath(url.pathname)) return null;
 
-  return env.ASSETS.fetch(request);
+  const response = await env.ASSETS.fetch(request);
+  return addSearchIndexHeaders(request, response);
 }
 
 async function ensureDatabaseInitialized(env: Env): Promise<void> {
@@ -56,9 +85,10 @@ async function ensureDatabaseInitialized(env: Env): Promise<void> {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     void ctx;
-    const assetResponse = await maybeServeAsset(request, env);
+    const normalizedRequest = normalizeRequestUrl(request);
+    const assetResponse = await maybeServeAsset(normalizedRequest, env);
     if (assetResponse) {
-      return applyCors(request, assetResponse);
+      return applyCors(normalizedRequest, assetResponse);
     }
 
     await ensureDatabaseInitialized(env);
@@ -76,11 +106,11 @@ export default {
         },
         500
       );
-      return applyCors(request, resp);
+      return applyCors(normalizedRequest, resp);
     }
 
-    const resp = await handleRequest(request, env);
-    return applyCors(request, resp);
+    const resp = await handleRequest(normalizedRequest, env);
+    return applyCors(normalizedRequest, resp);
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
